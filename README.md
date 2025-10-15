@@ -61,17 +61,11 @@ python3 macro.py run test.json -d none
 ```bash
 python3 -m pip install --upgrade pip
 python3 -m pip install pynput
+```
 
-
-## 🪟 Overlay Countdown (Bottom-Right)
-
-The macro runner shows a **small, always-on-top overlay** in the bottom-right corner with the **remaining runtime**.
-This overlay is enabled **by default**. You can disable it with `-d none`.
-
-### 📦 Install Requirements (Overlay)
+### 📦 Installation Requirements for the Timer Overlay
 
 The overlay uses **Tkinter**. Install it once, depending on your platform:
-```
 
 #### Linux
 
