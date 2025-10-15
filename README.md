@@ -30,7 +30,7 @@ python3 macro.py record test.json
 ```
 
 # Playback
-```bash<
+```bash
 python3 macro.py run test.json
 ```
 
@@ -42,6 +42,7 @@ python3 macro.py run test.json -s 1.5
 # Playback hide overlay
 ```bash
 python3 macro.py run test.json -d none
+```
 
 ---
 
@@ -93,6 +94,6 @@ sudo zypper install -y python3-tk
 ```bash
 sudo pacman -S --noconfirm tk
 ```
-```
+
 
 
