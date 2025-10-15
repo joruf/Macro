@@ -34,12 +34,12 @@ python3 macro.py record test.json
 python3 macro.py run test.json
 ```
 
-# Faster playback
+# Faster Playback
 ```bash
 python3 macro.py run test.json -s 1.5
 ```
 
-# Playback hide overlay
+# Playback Without Overlay
 ```bash
 python3 macro.py run test.json -d none
 ```
