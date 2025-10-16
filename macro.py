@@ -9,6 +9,8 @@ Highlights:
 - Bottom-right overlay countdown during 'run' (default). Disable with -d none.
 - Auto-install missing dependencies (best effort), plus manual install guide below.
 - Performance: countdown runs in its own lightweight thread; event timing is not slowed down.
+- Moves switch: -m on (default) keeps all mouse move events; -m off compacts to the last move
+  before each non-move event (timing preserved).
 
 Manual install quick guide:
     # Core dependency (all platforms)
@@ -30,9 +32,11 @@ Manual install quick guide:
 Usage examples:
     python3 macro.py record
     python3 macro.py record mymacro.json
-    python3 macro.py run                    # default: -s 1.0 -d overlay (bottom-right)
-    python3 macro.py run macro.json -s 1.5  # overlay still default
-    python3 macro.py run macro.json -d none # disable countdown dialog
+    python3 macro.py record mymacro.json -m on     # keep all moves (default)
+    python3 macro.py record mymacro.json -m off    # compact moves: keep only last move before clicks/keys
+    python3 macro.py run
+    python3 macro.py run macro.json -s 1.5
+    python3 macro.py run macro.json -d none
 """
 
 import os
@@ -88,7 +92,7 @@ def _try_install_tkinter() -> bool:
     managers = [
         ("apt-get", ["apt-get", "update"], ["apt-get", "install", "-y", "python3-tk"]),
         ("dnf", None, ["dnf", "install", "-y", "python3-tkinter"]),
-        ("zypper", None, ["zypper", "install", "-y", "python3-tk"]),
+        ("zypper", None, ["zypper", "install", -y, "python3-tk"]),
         ("pacman", None, ["pacman", "-S", "--noconfirm", "tk"]),
         ("apk", None, ["apk", "add", "tcl", "tk", "python3-tkinter"]),
     ]
@@ -164,7 +168,6 @@ class _OverlayStatus:
     def close(self) -> None:
         """Request closing the overlay from any thread."""
         self._alive.clear()
-        # schedule a safe close from the Tk thread
         if self._root is not None:
             try:
                 self._root.after(0, self._root.destroy)
@@ -220,7 +223,6 @@ class _OverlayStatus:
                 except Exception:
                     pass
                 return
-            # drain queue
             need_reflow = False
             with self._q_lock:
                 if self._text_queue:
@@ -246,12 +248,17 @@ class _OverlayStatus:
 
 # ----------------------------- Recording -------------------------------------
 
-def record_until_q(output_file: str = "macro.json") -> None:
+def record_until_q(
+    output_file: str = "macro.json",
+    moves: str = "on",
+) -> None:
     """
     Record mouse and keyboard events and store per-event delays ("dt") until ESC is pressed.
 
     Args:
         output_file: JSON path to write the recorded events.
+        moves: 'on' to store all move events (default), 'off' to compact moves so that
+               only the single last move before each non-move event is kept.
     """
     from pynput import mouse, keyboard
 
@@ -263,8 +270,7 @@ def record_until_q(output_file: str = "macro.json") -> None:
 
     events: List[dict] = []
     stop_evt = Event()
-    start_time = time.time()
-    last_abs = start_time
+    last_abs = time.time()
     ABORT_KEY = _get_abort_key()
 
     def now_abs() -> float:
@@ -273,6 +279,7 @@ def record_until_q(output_file: str = "macro.json") -> None:
 
     # Mouse callbacks
     def on_move(x, y):
+        """Record a mouse move with relative dt."""
         nonlocal last_abs
         cur = now_abs()
         dt = cur - last_abs
@@ -280,6 +287,7 @@ def record_until_q(output_file: str = "macro.json") -> None:
         events.append({"dt": dt, "type": "move", "x": x, "y": y})
 
     def on_click(x, y, button, pressed):
+        """Record mouse click press/release with relative dt."""
         nonlocal last_abs
         cur = now_abs()
         dt = cur - last_abs
@@ -294,6 +302,7 @@ def record_until_q(output_file: str = "macro.json") -> None:
         })
 
     def on_scroll(x, y, dx, dy):
+        """Record a mouse scroll with relative dt."""
         nonlocal last_abs
         cur = now_abs()
         dt = cur - last_abs
@@ -302,7 +311,10 @@ def record_until_q(output_file: str = "macro.json") -> None:
 
     # Keyboard callbacks
     def on_press(key):
-        """Stop immediately when ESC is pressed; do not record the abort key."""
+        """
+        Record key press with relative dt. Abort immediately when ESC is pressed;
+        do not record the abort key.
+        """
         nonlocal last_abs
         try:
             if key == ABORT_KEY:
@@ -318,7 +330,7 @@ def record_until_q(output_file: str = "macro.json") -> None:
         events.append({"dt": dt, "type": "key", "key": key_str, "pressed": True})
 
     def on_release(key):
-        """Handle key releases, skip the abort key."""
+        """Record key release with relative dt; skip the abort key."""
         if stop_evt.is_set():
             return False
         key_str = _key_to_str(key)
@@ -345,16 +357,31 @@ def record_until_q(output_file: str = "macro.json") -> None:
         m_listener.join()
         k_listener.join()
 
-    out_path.write_text(json.dumps(events, indent=2))
-    print(f"✅ Recorded {len(events)} events → {out_path}")
+    # Optionally compact excessive mouse moves while preserving timing
+    final_events = events
+    if moves == "off":
+        # Keep only the single last move before each non-move event
+        final_events = compact_moves(events, keep_moves=1)
+
+    out_path.write_text(json.dumps(final_events, indent=2))
+    print(
+        f"✅ Recorded {len(events)} raw events; wrote {len(final_events)} events "
+        f"(moves='{moves}') → {out_path}"
+    )
 
 
 # ------------------------------ Runner ---------------------------------------
 
-def run_macro(input_file: str = "macro.json", speed: float = 1.0,
-              dialog: str = "overlay") -> None:
+def run_macro(
+    input_file: str = "macro.json",
+    speed: float = 1.0,
+    dialog: str = "overlay"
+) -> None:
     """
     Run (play back) a recorded macro from JSON, with a subtle bottom-right countdown.
+
+    Uses a context-managed KeyListener to ensure clean shutdown so the process
+    returns control to the shell promptly after finishing.
 
     Args:
         input_file: Path to the JSON file to read events from.
@@ -374,120 +401,111 @@ def run_macro(input_file: str = "macro.json", speed: float = 1.0,
     ABORT_KEY = Key.esc
 
     overlay: Optional[_OverlayStatus] = None
-    countdown_thread = None
 
-    # ESC listener (ignores injected ESC)
     def on_press(key):
+        """Abort the run if the user presses ESC (ignoring injected ESC events)."""
         try:
             if key == ABORT_KEY:
                 if ABORT_KEY_STR in injected_keys:
                     return
                 print(f"\n⏹ Aborting run ({ABORT_KEY_HUMAN} pressed)…")
                 stop_evt.set()
-                # also close overlay if present
                 if overlay:
                     overlay.close()
                 return False
         except Exception:
             pass
 
-    k_listener = KeyListener(on_press=on_press)
-    k_listener.start()
+    # Use context manager so that listener is stopped and joined reliably on exit
+    from pynput.keyboard import Listener as _KListener
+    with _KListener(on_press=on_press) as k_listener:
 
-    def playback_loop():
-        """Worker thread: executes the actual macro playback."""
-        nonlocal overlay
-        print(f"▶ Running {len(data)} events at {speed}x… (press {ABORT_KEY_HUMAN} to abort)")
-        try:
-            for dt, ev in events_with_dt:
-                if stop_evt.is_set():
-                    break
-                scaled = dt / max(speed, 1e-6)
-                _wait_with_abort(scaled, stop_evt)
-                if stop_evt.is_set():
-                    break
+        def playback_loop():
+            """Execute the actual macro playback."""
+            nonlocal overlay
+            print(f"▶ Running {len(data)} events at {speed}x… (press {ABORT_KEY_HUMAN} to abort)")
+            try:
+                for dt, ev in events_with_dt:
+                    if stop_evt.is_set():
+                        break
+                    scaled = dt / max(speed, 1e-6)
+                    _wait_with_abort(scaled, stop_evt)
+                    if stop_evt.is_set():
+                        break
 
-                et = ev["type"]
-                if et == "move":
-                    mouse_ctl.position = (ev["x"], ev["y"])
-                elif et == "click":
-                    btn_name = ev.get("button", "left")
-                    btn = getattr(Button, btn_name, Button.left)
-                    if ev.get("pressed", True):
-                        mouse_ctl.press(btn)
-                    else:
-                        mouse_ctl.release(btn)
-                elif et == "scroll":
-                    mouse_ctl.scroll(ev.get("dx", 0), ev.get("dy", 0))
-                elif et == "key":
-                    key_obj = _str_to_key(ev["key"])
-                    if ev.get("key") == ABORT_KEY_STR:
-                        injected_keys.add(ABORT_KEY_STR)
-                    try:
+                    et = ev["type"]
+                    if et == "move":
+                        mouse_ctl.position = (ev["x"], ev["y"])
+                    elif et == "click":
+                        btn_name = ev.get("button", "left")
+                        btn = getattr(Button, btn_name, Button.left)
                         if ev.get("pressed", True):
-                            key_ctl.press(key_obj)
+                            mouse_ctl.press(btn)
                         else:
-                            key_ctl.release(key_obj)
-                    finally:
-                        if ev.get("key") == ABORT_KEY_STR and not ev.get("pressed", True):
-                            injected_keys.discard(ABORT_KEY_STR)
-        finally:
-            # Tell the overlay to close when done
-            if overlay:
-                overlay.close()
+                            mouse_ctl.release(btn)
+                    elif et == "scroll":
+                        mouse_ctl.scroll(ev.get("dx", 0), ev.get("dy", 0))
+                    elif et == "key":
+                        key_obj = _str_to_key(ev["key"])
+                        if ev.get("key") == ABORT_KEY_STR:
+                            injected_keys.add(ABORT_KEY_STR)
+                        try:
+                            if ev.get("pressed", True):
+                                key_ctl.press(key_obj)
+                            else:
+                                key_ctl.release(key_obj)
+                        finally:
+                            if ev.get("key") == ABORT_KEY_STR and not ev.get("pressed", True):
+                                injected_keys.discard(ABORT_KEY_STR)
+            finally:
+                # Always signal completion and close overlay (if any)
+                stop_evt.set()
+                if overlay:
+                    overlay.close()
 
-    # Setup optional overlay and countdown
-    if dialog == "overlay" and total_scaled > 0:
-        overlay = _OverlayStatus()
+        if dialog == "overlay" and total_scaled > 0:
+            overlay = _OverlayStatus()
 
-        def fmt_time(sec: float) -> str:
-            sec = max(0, int(round(sec)))
-            h, rem = divmod(sec, 3600)
-            m, s = divmod(rem, 60)
-            return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            def fmt_time(sec: float) -> str:
+                """Format seconds as MM:SS or HH:MM:SS if hours are present."""
+                sec = max(0, int(round(sec)))
+                h, rem = divmod(sec, 3600)
+                m, s = divmod(rem, 60)
+                return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-        def countdown_loop(t_total: float):
-            t0 = time.time()
-            while not stop_evt.is_set():
-                remaining = max(0.0, t_total - (time.time() - t0))
-                overlay.update_text(f"⏳ remaining {fmt_time(remaining)}")
-                if remaining <= 0.0:
-                    break
-                time.sleep(0.5)
-            if not stop_evt.is_set():
-                overlay.update_text("⏳ remaining 00:00")
+            def countdown_loop(t_total: float):
+                """Continuously update the overlay with remaining time until done or aborted."""
+                t0 = time.time()
+                while not stop_evt.is_set():
+                    remaining = max(0.0, t_total - (time.time() - t0))
+                    overlay.update_text(f"⏳ remaining {fmt_time(remaining)}")
+                    if remaining <= 0.0:
+                        break
+                    time.sleep(0.5)
+                if not stop_evt.is_set():
+                    overlay.update_text("⏳ remaining 00:00")
 
-        # Start playback worker
-        worker = Thread(target=playback_loop, daemon=True)
-        worker.start()
+            worker = Thread(target=playback_loop, daemon=False)
+            countdown_thread = Thread(target=countdown_loop, args=(total_scaled,), daemon=False)
+            worker.start()
+            countdown_thread.start()
 
-        # Start countdown worker
-        countdown_thread = Thread(target=countdown_loop, args=(total_scaled,), daemon=True)
-        countdown_thread.start()
+            # Tk mainloop runs on main thread; returns after overlay.close()
+            overlay.mainloop()
 
-        # IMPORTANT: Run Tk mainloop on the main thread (blocks until overlay closes)
-        overlay.mainloop()
+            # Join workers to ensure no threads linger
+            worker.join()
+            countdown_thread.join()
 
-        # Join workers before exiting
-        worker.join(timeout=2.0)
-        if countdown_thread:
-            countdown_thread.join(timeout=1.0)
-
-    else:
-        # No overlay: run playback directly on main thread
-        try:
+        else:
+            # No overlay: run playback synchronously on this thread
             playback_loop()
-        finally:
-            pass
 
-    injected_keys.clear()
-    k_listener.stop()
-    k_listener.join()
-
-    if stop_evt.is_set():
-        print("🛑 Run aborted by user.")
-    else:
         print("✅ Run finished.")
+
+    # Exiting the 'with' block stops and joins the KeyListener thread.
+    # No background threads remain at this point.
+    return
 
 
 # ------------------------ Utility functions ----------------------------------
@@ -528,7 +546,12 @@ def _str_to_key(s: str):
 
 
 def _normalize_to_dt(data: List[dict]) -> List[Tuple[float, dict]]:
-    """Convert a loaded JSON event list into a list of (dt, event) tuples."""
+    """
+    Convert a loaded JSON event list into a list of (dt, event) tuples.
+
+    Supports legacy formats that had absolute 't' times by converting them
+    into relative 'dt' between events.
+    """
     result: List[Tuple[float, dict]] = []
     if not data:
         return result
@@ -558,6 +581,64 @@ def _wait_with_abort(seconds: float, stop_evt: Event) -> None:
         time.sleep(min(remaining, 0.005))
 
 
+def compact_moves(events: List[dict], keep_moves: int = 1) -> List[dict]:
+    """
+    Compact runs of consecutive 'move' events so that only the last N moves right
+    before any non-move event (click/key/scroll) are kept. The total relative time
+    before that non-move event is preserved by rolling the dropped dt into the first
+    kept move (or into the subsequent non-move event if no move is kept).
+
+    With keep_moves=1 this results in exactly one move (the last) before each non-move.
+
+    Args:
+        events: Original event list (must have 'dt' per event).
+        keep_moves: Number of trailing move events to retain before each non-move (default 1).
+
+    Returns:
+        A new list of events with fewer 'move' entries but identical cumulative timing
+        for all non-move events (click/key/scroll) and thus preserved key press durations.
+    """
+    if keep_moves is None or keep_moves < 0:
+        keep_moves = 1
+
+    out: List[dict] = []
+    move_buf: List[dict] = []
+
+    def flush_moves_before(next_event: Optional[dict]) -> None:
+        """Flush the buffered moves, keeping only the last N and preserving total dt."""
+        nonlocal out, move_buf
+        if not move_buf:
+            return
+        total_dt = sum(float(ev.get("dt", 0.0)) for ev in move_buf)
+        kept = move_buf[-keep_moves:] if keep_moves > 0 else []
+        dropped = move_buf[:-keep_moves] if keep_moves > 0 else move_buf
+        dropped_dt = sum(float(ev.get("dt", 0.0)) for ev in dropped)
+
+        if kept:
+            kept_first = dict(kept[0])
+            kept_first["dt"] = float(kept_first.get("dt", 0.0)) + dropped_dt
+            out.extend([kept_first, *kept[1:]])
+        else:
+            if next_event is not None:
+                next_event["dt"] = float(next_event.get("dt", 0.0)) + total_dt
+            else:
+                # End-of-stream idle time does not affect playback; drop it.
+                pass
+        move_buf.clear()
+
+    for ev in events:
+        et = ev.get("type")
+        if et == "move":
+            move_buf.append(dict(ev))
+            continue
+        ev_copy = dict(ev)
+        flush_moves_before(ev_copy)
+        out.append(ev_copy)
+
+    flush_moves_before(next_event=None)
+    return out
+
+
 # ------------------------------ CLI ------------------------------------------
 
 def _build_argparser():
@@ -567,6 +648,12 @@ def _build_argparser():
 
     r = sub.add_parser("record", help=f"Record until you press {ABORT_KEY_HUMAN}.")
     r.add_argument("path", nargs="?", default="macro.json", help="Output JSON path.")
+    r.add_argument(
+        "-m", "--moves",
+        choices=("on", "off"),
+        default="on",
+        help="Mouse move recording: 'on' keeps all moves (default), 'off' compacts to the last move before each non-move."
+    )
 
     rn = sub.add_parser("run", help="Run a recorded macro from JSON.")
     rn.add_argument("path", nargs="?", default="macro.json", help="Input JSON path.")
@@ -587,7 +674,10 @@ def main():
 
     if args.cmd == "record":
         _ = ensure_dependencies("none")  # only pynput
-        record_until_q(output_file=args.path)
+        record_until_q(
+            output_file=args.path,
+            moves=args.moves,
+        )
 
     elif args.cmd == "run":
         dialog_mode = ensure_dependencies(args.dialog)
