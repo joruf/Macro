@@ -9,7 +9,10 @@ It records all mouse and keyboard activity with precise per-event timing, and re
 
 ## ✨ Features
 
-- 🎙 **Record** all keyboard and mouse actions until you press **ESC**
+- 🎙 Record all keyboard and mouse actions until you press ESC
+→ You can control how mouse movements are stored using -m on|off:
+  • -m on (default) – record all mouse movements with full precision
+  • -m off – compact movements, keeping only the last move before each click or key event 
 - ▶️ **Run (play back)** the recorded macro in real-time or at custom speed (`-s`)
 - 💾 **JSON-based format** – easy to inspect and edit manually
 - ⏳ **Live countdown overlay** (bottom-right corner, enabled by default)  
@@ -27,6 +30,11 @@ It records all mouse and keyboard activity with precise per-event timing, and re
 # Record
 ```bash
 python3 macro.py record test.json
+```
+
+# Record compact moves (keep only last move before clicks/keys)
+```bash
+python3 macro.py record test.json -m off
 ```
 
 # Playback
