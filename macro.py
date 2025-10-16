@@ -140,46 +140,53 @@ def _get_abort_key():
 # ------------------------ Bottom-right Overlay -------------------------------
 
 class _OverlayStatus:
-    """Tiny always-on-top overlay at the bottom-right that shows a countdown."""
+    """Tiny always-on-top overlay at the bottom-right that shows a countdown.
 
+    All Tk operations are confined to the main thread. Other threads only push
+    text updates onto a queue.
+    """
     def __init__(self) -> None:
-        """
-        Create a small overlay near the bottom-right edge.
-        """
+        """Prepare overlay state; actual Tk setup is done in mainloop()."""
+        from threading import Lock
         self._alive = Event()
         self._alive.set()
         self._text_queue: List[str] = []
-        self._thread: Optional[Thread] = None
-        self._ready = Event()
-
-        # Start the Tk UI in a background thread to avoid blocking the runner.
-        self._thread = Thread(target=self._run_tk, daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=2.0)
+        self._q_lock = Lock()
+        self._root = None
+        self._label = None
 
     def update_text(self, text: str) -> None:
-        """Queue a text update for the overlay label."""
-        self._text_queue.append(text)
+        """Queue a text update for the overlay label (thread-safe)."""
+        from threading import Lock
+        with self._q_lock:
+            self._text_queue.append(text)
 
     def close(self) -> None:
-        """Close the overlay."""
+        """Request closing the overlay from any thread."""
         self._alive.clear()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+        # schedule a safe close from the Tk thread
+        if self._root is not None:
+            try:
+                self._root.after(0, self._root.destroy)
+            except Exception:
+                pass
 
-    # ---- Internal: Tk thread ------------------------------------------------
-    def _run_tk(self) -> None:
+    def mainloop(self) -> None:
+        """Create Tk UI and enter mainloop. Must be called on the main thread."""
         try:
             import tkinter as tk
         except Exception:
-            self._ready.set()
+            # Tk not available; just spin until someone calls close()
+            while self._alive.is_set():
+                time.sleep(0.1)
             return
 
         root = tk.Tk()
-        root.overrideredirect(True)  # borderless
+        self._root = root
+        root.overrideredirect(True)
         try:
             root.wm_attributes("-topmost", 1)
-            root.wm_attributes("-alpha", 0.85)  # slight transparency
+            root.wm_attributes("-alpha", 0.85)
         except Exception:
             pass
 
@@ -192,9 +199,10 @@ class _OverlayStatus:
             padx=10,
             pady=4,
         )
+        self._label = lbl
         lbl.pack()
 
-        # Compute initial geometry (bottom-right, a few px above border)
+        # Position bottom-right
         root.update_idletasks()
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
@@ -205,8 +213,6 @@ class _OverlayStatus:
         y = max(0, sh - h - margin)
         root.geometry(f"{w}x{h}+{x}+{y}")
 
-        self._ready.set()
-
         def tick():
             if not self._alive.is_set():
                 try:
@@ -214,20 +220,24 @@ class _OverlayStatus:
                 except Exception:
                     pass
                 return
-            if self._text_queue:
-                text = self._text_queue[-1]
-                self._text_queue.clear()
-                lbl.config(text=text)
-                # Reflow if size changed
+            # drain queue
+            need_reflow = False
+            with self._q_lock:
+                if self._text_queue:
+                    text = self._text_queue[-1]
+                    self._text_queue.clear()
+                    lbl.config(text=text)
+                    need_reflow = True
+            if need_reflow:
                 root.update_idletasks()
                 nw = lbl.winfo_reqwidth()
                 nh = lbl.winfo_reqheight()
                 nx = max(0, sw - nw - margin)
                 ny = max(0, sh - nh - margin)
                 root.geometry(f"{nw}x{nh}+{nx}+{ny}")
-            root.after(250, tick)  # subtle updates
+            root.after(250, tick)
 
-        tick()
+        root.after(0, tick)
         try:
             root.mainloop()
         except Exception:
@@ -356,8 +366,6 @@ def run_macro(input_file: str = "macro.json", speed: float = 1.0,
 
     data = json.loads(Path(input_file).read_text())
     events_with_dt = _normalize_to_dt(data)
-
-    # Pre-compute total scaled runtime ONCE
     total_scaled = sum(dt for dt, _ in events_with_dt) / max(speed, 1e-6)
 
     mouse_ctl, key_ctl = MouseCtl(), KeyCtl()
@@ -365,17 +373,73 @@ def run_macro(input_file: str = "macro.json", speed: float = 1.0,
     injected_keys: set[str] = set()
     ABORT_KEY = Key.esc
 
-    # Bottom-right overlay: separate lightweight thread (no per-event callbacks)
     overlay: Optional[_OverlayStatus] = None
-    if dialog == "overlay" and total_scaled > 0:
-        try:
-            overlay = _OverlayStatus()
-        except Exception:
-            overlay = None  # continue silently without overlay
-
-    # Start countdown thread (independent of event timing)
     countdown_thread = None
-    if overlay:
+
+    # ESC listener (ignores injected ESC)
+    def on_press(key):
+        try:
+            if key == ABORT_KEY:
+                if ABORT_KEY_STR in injected_keys:
+                    return
+                print(f"\n⏹ Aborting run ({ABORT_KEY_HUMAN} pressed)…")
+                stop_evt.set()
+                # also close overlay if present
+                if overlay:
+                    overlay.close()
+                return False
+        except Exception:
+            pass
+
+    k_listener = KeyListener(on_press=on_press)
+    k_listener.start()
+
+    def playback_loop():
+        """Worker thread: executes the actual macro playback."""
+        nonlocal overlay
+        print(f"▶ Running {len(data)} events at {speed}x… (press {ABORT_KEY_HUMAN} to abort)")
+        try:
+            for dt, ev in events_with_dt:
+                if stop_evt.is_set():
+                    break
+                scaled = dt / max(speed, 1e-6)
+                _wait_with_abort(scaled, stop_evt)
+                if stop_evt.is_set():
+                    break
+
+                et = ev["type"]
+                if et == "move":
+                    mouse_ctl.position = (ev["x"], ev["y"])
+                elif et == "click":
+                    btn_name = ev.get("button", "left")
+                    btn = getattr(Button, btn_name, Button.left)
+                    if ev.get("pressed", True):
+                        mouse_ctl.press(btn)
+                    else:
+                        mouse_ctl.release(btn)
+                elif et == "scroll":
+                    mouse_ctl.scroll(ev.get("dx", 0), ev.get("dy", 0))
+                elif et == "key":
+                    key_obj = _str_to_key(ev["key"])
+                    if ev.get("key") == ABORT_KEY_STR:
+                        injected_keys.add(ABORT_KEY_STR)
+                    try:
+                        if ev.get("pressed", True):
+                            key_ctl.press(key_obj)
+                        else:
+                            key_ctl.release(key_obj)
+                    finally:
+                        if ev.get("key") == ABORT_KEY_STR and not ev.get("pressed", True):
+                            injected_keys.discard(ABORT_KEY_STR)
+        finally:
+            # Tell the overlay to close when done
+            if overlay:
+                overlay.close()
+
+    # Setup optional overlay and countdown
+    if dialog == "overlay" and total_scaled > 0:
+        overlay = _OverlayStatus()
+
         def fmt_time(sec: float) -> str:
             sec = max(0, int(round(sec)))
             h, rem = divmod(sec, 3600)
@@ -393,69 +457,32 @@ def run_macro(input_file: str = "macro.json", speed: float = 1.0,
             if not stop_evt.is_set():
                 overlay.update_text("⏳ remaining 00:00")
 
+        # Start playback worker
+        worker = Thread(target=playback_loop, daemon=True)
+        worker.start()
+
+        # Start countdown worker
         countdown_thread = Thread(target=countdown_loop, args=(total_scaled,), daemon=True)
         countdown_thread.start()
 
-    # ESC listener (ignores injected ESC)
-    def on_press(key):
-        try:
-            if key == ABORT_KEY:
-                if ABORT_KEY_STR in injected_keys:
-                    return
-                print(f"\n⏹ Aborting run ({ABORT_KEY_HUMAN} pressed)…")
-                stop_evt.set()
-                return False
-        except Exception:
-            pass
+        # IMPORTANT: Run Tk mainloop on the main thread (blocks until overlay closes)
+        overlay.mainloop()
 
-    k_listener = KeyListener(on_press=on_press)
-    k_listener.start()
-
-    print(f"▶ Running {len(data)} events at {speed}x… (press {ABORT_KEY_HUMAN} to abort)")
-
-    try:
-        for dt, ev in events_with_dt:
-            if stop_evt.is_set():
-                break
-
-            # Wait the scaled per-event delay — minimal overhead, no UI ticks here
-            scaled = dt / max(speed, 1e-6)
-            _wait_with_abort(scaled, stop_evt)
-            if stop_evt.is_set():
-                break
-
-            et = ev["type"]
-            if et == "move":
-                mouse_ctl.position = (ev["x"], ev["y"])
-            elif et == "click":
-                btn_name = ev.get("button", "left")
-                btn = getattr(Button, btn_name, Button.left)
-                if ev.get("pressed", True):
-                    mouse_ctl.press(btn)
-                else:
-                    mouse_ctl.release(btn)
-            elif et == "scroll":
-                mouse_ctl.scroll(ev.get("dx", 0), ev.get("dy", 0))
-            elif et == "key":
-                key_obj = _str_to_key(ev["key"])
-                if ev.get("key") == ABORT_KEY_STR:
-                    injected_keys.add(ABORT_KEY_STR)
-                try:
-                    if ev.get("pressed", True):
-                        key_ctl.press(key_obj)
-                    else:
-                        key_ctl.release(key_obj)
-                finally:
-                    if ev.get("key") == ABORT_KEY_STR and not ev.get("pressed", True):
-                        injected_keys.discard(ABORT_KEY_STR)
-    finally:
-        if overlay:
-            overlay.close()
+        # Join workers before exiting
+        worker.join(timeout=2.0)
         if countdown_thread:
             countdown_thread.join(timeout=1.0)
-        injected_keys.clear()
-        k_listener.stop()
-        k_listener.join()
+
+    else:
+        # No overlay: run playback directly on main thread
+        try:
+            playback_loop()
+        finally:
+            pass
+
+    injected_keys.clear()
+    k_listener.stop()
+    k_listener.join()
 
     if stop_evt.is_set():
         print("🛑 Run aborted by user.")
