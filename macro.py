@@ -22,10 +22,12 @@ Manual install quick guide:
     sudo apt-get update && sudo apt-get install -y python3-tk
     # Fedora/RHEL:
     sudo dnf install -y python3-tkinter
-    # Arch/Manjaro:
-    sudo pacman -S --noconfirm tk
     # openSUSE:
     sudo zypper install -y python3-tk
+    # Arch/Manjaro:
+    sudo pacman -S --noconfirm tk
+    # Alpine:
+    sudo apk add tcl tk python3-tkinter
     # macOS (Python.org builds often include Tk; with Homebrew:)
     brew install tcl-tk   # ensure your Python uses this Tk (see brew caveats)
 
@@ -92,7 +94,7 @@ def _try_install_tkinter() -> bool:
     managers = [
         ("apt-get", ["apt-get", "update"], ["apt-get", "install", "-y", "python3-tk"]),
         ("dnf", None, ["dnf", "install", "-y", "python3-tkinter"]),
-        ("zypper", None, ["zypper", "install", -y, "python3-tk"]),
+        ("zypper", None, ["zypper", "install", "-y", "python3-tk"]),  # fixed: "-y" is a string
         ("pacman", None, ["pacman", "-S", "--noconfirm", "tk"]),
         ("apk", None, ["apk", "add", "tcl", "tk", "python3-tkinter"]),
     ]
@@ -151,17 +153,16 @@ class _OverlayStatus:
     """
     def __init__(self) -> None:
         """Prepare overlay state; actual Tk setup is done in mainloop()."""
-        from threading import Lock
         self._alive = Event()
         self._alive.set()
         self._text_queue: List[str] = []
+        from threading import Lock
         self._q_lock = Lock()
         self._root = None
         self._label = None
 
     def update_text(self, text: str) -> None:
         """Queue a text update for the overlay label (thread-safe)."""
-        from threading import Lock
         with self._q_lock:
             self._text_queue.append(text)
 
@@ -375,32 +376,50 @@ def record_until_q(
 def run_macro(
     input_file: str = "macro.json",
     speed: float = 1.0,
-    dialog: str = "overlay"
+    dialog: str = "overlay",
+    hard_exit: bool = True,
 ) -> None:
     """
-    Run (play back) a recorded macro from JSON, with a subtle bottom-right countdown.
-
-    Uses a context-managed KeyListener to ensure clean shutdown so the process
-    returns control to the shell promptly after finishing.
+    Run (play back) a recorded macro from JSON, with an optional bottom-right countdown.
+    On abort or finish, perform a robust teardown and (optionally) force a hard exit to
+    guarantee the shell is returned even if third-party threads linger.
 
     Args:
-        input_file: Path to the JSON file to read events from.
-        speed: Playback speed multiplier. 1.0 = real-time; 2.0 = twice as fast.
+        input_file: Path to the JSON file.
+        speed: Playback speed multiplier.
         dialog: 'overlay' (default) or 'none'.
+        hard_exit: If True, terminate the process via os._exit(0) after cleanup.
     """
     from pynput.mouse import Controller as MouseCtl, Button
     from pynput.keyboard import Controller as KeyCtl, Listener as KeyListener, Key
-
-    data = json.loads(Path(input_file).read_text())
-    events_with_dt = _normalize_to_dt(data)
-    total_scaled = sum(dt for dt, _ in events_with_dt) / max(speed, 1e-6)
+    import signal
 
     mouse_ctl, key_ctl = MouseCtl(), KeyCtl()
     stop_evt = Event()
     injected_keys: set[str] = set()
     ABORT_KEY = Key.esc
-
     overlay: Optional[_OverlayStatus] = None
+
+    # --- Graceful signal handling -------------------------------------------
+    def _graceful_stop(signum, frame):
+        """Signal handler that requests a clean shutdown without tracebacks."""
+        stop_evt.set()
+        try:
+            if overlay:
+                overlay.close()
+        except Exception:
+            pass
+
+    try:
+        signal.signal(signal.SIGINT, _graceful_stop)
+        signal.signal(signal.SIGTERM, _graceful_stop)
+    except Exception:
+        pass
+
+    # Load and normalize data
+    data = json.loads(Path(input_file).read_text())
+    events_with_dt = _normalize_to_dt(data)
+    total_scaled = sum(dt for dt, _ in events_with_dt) / max(speed, 1e-6)
 
     def on_press(key):
         """Abort the run if the user presses ESC (ignoring injected ESC events)."""
@@ -416,10 +435,58 @@ def run_macro(
         except Exception:
             pass
 
-    # Use context manager so that listener is stopped and joined reliably on exit
+    # Explicitly manage the keyboard listener
     from pynput.keyboard import Listener as _KListener
-    with _KListener(on_press=on_press) as k_listener:
+    k_listener = _KListener(on_press=on_press)
+    try:
+        k_listener.daemon = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    k_listener.start()
 
+    def _final_teardown() -> None:
+        """Best-effort stop/join of resources; optionally hard-exit the process."""
+        # Stop listener
+        try:
+            k_listener.stop()
+        except Exception:
+            pass
+        try:
+            k_listener.join(timeout=1.0)
+        except Exception:
+            pass
+        # Close overlay
+        try:
+            if overlay:
+                overlay.close()
+        except Exception:
+            pass
+        # Help GC close low-level resources
+        try:
+            del mouse_ctl, key_ctl
+        except Exception:
+            pass
+        # As a last resort, kill any known pynput threads and exit hard
+        if hard_exit:
+            try:
+                import threading
+                for t in threading.enumerate():
+                    if t is threading.current_thread():
+                        continue
+                    name = getattr(t, "name", "").lower()
+                    mod = getattr(t, "__module__", "")
+                    # Mark suspicious threads as daemons to avoid blocking
+                    if "pynput" in name or "pynput" in mod or "xlib" in name:
+                        try:
+                            t.daemon = True  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Guaranteed return to shell
+            os._exit(0)
+
+    try:
         def playback_loop():
             """Execute the actual macro playback."""
             nonlocal overlay
@@ -458,7 +525,6 @@ def run_macro(
                             if ev.get("key") == ABORT_KEY_STR and not ev.get("pressed", True):
                                 injected_keys.discard(ABORT_KEY_STR)
             finally:
-                # Always signal completion and close overlay (if any)
                 stop_evt.set()
                 if overlay:
                     overlay.close()
@@ -485,27 +551,34 @@ def run_macro(
                 if not stop_evt.is_set():
                     overlay.update_text("⏳ remaining 00:00")
 
-            worker = Thread(target=playback_loop, daemon=False)
-            countdown_thread = Thread(target=countdown_loop, args=(total_scaled,), daemon=False)
+            worker = Thread(target=playback_loop, daemon=True)
+            countdown_thread = Thread(target=countdown_loop, args=(total_scaled,), daemon=True)
             worker.start()
             countdown_thread.start()
 
             # Tk mainloop runs on main thread; returns after overlay.close()
             overlay.mainloop()
 
-            # Join workers to ensure no threads linger
-            worker.join()
-            countdown_thread.join()
+            # Best-effort joins (non-blocking due to daemon=True)
+            try:
+                worker.join(timeout=0.5)
+                countdown_thread.join(timeout=0.5)
+            except Exception:
+                pass
 
         else:
             # No overlay: run playback synchronously on this thread
-            playback_loop()
+            try:
+                playback_loop()
+            except KeyboardInterrupt:
+                stop_evt.set()
+                if overlay:
+                    overlay.close()
 
         print("✅ Run finished.")
 
-    # Exiting the 'with' block stops and joins the KeyListener thread.
-    # No background threads remain at this point.
-    return
+    finally:
+        _final_teardown()
 
 
 # ------------------------ Utility functions ----------------------------------
@@ -664,6 +737,12 @@ def _build_argparser():
         default="overlay",
         help="Countdown display: overlay (default) or none."
     )
+    rn.add_argument(
+        "--no-hard-exit",
+        dest="hard_exit",
+        action="store_false",
+        help="Do best-effort cleanup and return via sys.exit instead of os._exit.",
+    )
 
     return p
 
@@ -681,7 +760,7 @@ def main():
 
     elif args.cmd == "run":
         dialog_mode = ensure_dependencies(args.dialog)
-        run_macro(input_file=args.path, speed=args.speed, dialog=dialog_mode)
+        run_macro(input_file=args.path, speed=args.speed, dialog=dialog_mode, hard_exit=args.hard_exit)
 
 
 if __name__ == "__main__":
